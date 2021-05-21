@@ -150,10 +150,12 @@ func setupEnvironment(t *testing.T) ServiceReconciler {
 	c := cache.NewCache()
 
 	return ServiceReconciler{
-		Client: client,
-		Log:    ctrl.Log.WithName("reconcilerTest"),
-		Scheme: nil,
-		Cache:  &c,
+		Client:        client,
+		Log:           ctrl.Log.WithName("reconcilerTest"),
+		Scheme:        nil,
+		Cache:         &c,
+		ServiceReader: client,
+		ServiceWriter: client,
 	}
 }
 

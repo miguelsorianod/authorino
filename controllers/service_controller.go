@@ -43,9 +43,11 @@ import (
 // ServiceReconciler reconciles a Service object
 type ServiceReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
-	Cache  *cache.Cache
+	ServiceReader client.Reader
+	ServiceWriter client.Writer
+	Log           logr.Logger
+	Scheme        *runtime.Scheme
+	Cache         *cache.Cache
 }
 
 // +kubebuilder:rbac:groups=config.authorino.3scale.net,resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -57,7 +59,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("service", req.NamespacedName)
 
 	service := configv1beta1.Service{}
-	err := r.Get(ctx, req.NamespacedName, &service)
+	err := r.ServiceReader.Get(ctx, req.NamespacedName, &service)
 	if err != nil && errors.IsNotFound(err) {
 
 		// As we can't get the object, that means it was deleted.
@@ -74,26 +76,33 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	// The object exists so we need to either create it or update
-	config, err := r.translateService(ctx, &service)
-	if err != nil {
+	if serviceConfigByHost, err := r.translateService(ctx, &service); err != nil {
 		return ctrl.Result{}, err
-	}
-
-	for serviceHost, apiConfig := range config {
-		err := r.Cache.Set(req.String(), serviceHost, apiConfig, true)
-		if err != nil {
-			return ctrl.Result{}, err
+	} else {
+		for serviceHost, apiConfig := range serviceConfigByHost {
+			if err := r.Cache.Set(req.String(), serviceHost, apiConfig, true); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
 	// TODO: This is not enough. Fix the whole Readiness.
 	service.Status.Ready = true
-	err = r.Client.Update(ctx, &service)
+	err = r.ServiceWriter.Update(ctx, &service)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func findIdentityConfigByName(identityConfigs []config.IdentityConfig, name string) (*config.IdentityConfig, error) {
+	for _, id := range identityConfigs {
+		if id.Name == name {
+			return &id, nil
+		}
+	}
+	return nil, fmt.Errorf("missing identity config %v", name)
 }
 
 func (r *ServiceReconciler) translateService(ctx context.Context, service *configv1beta1.Service) (map[string]authorinoService.APIConfig, error) {
@@ -309,13 +318,4 @@ func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&configv1beta1.Service{}).
 		Complete(r)
-}
-
-func findIdentityConfigByName(identityConfigs []config.IdentityConfig, name string) (*config.IdentityConfig, error) {
-	for _, id := range identityConfigs {
-		if id.Name == name {
-			return &id, nil
-		}
-	}
-	return nil, fmt.Errorf("missing identity config %v", name)
 }

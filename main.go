@@ -41,20 +41,28 @@ import (
 	// +kubebuilder:scaffold:imports
 )
 
+const (
+	gRPCMaxConcurrentStreams           = 10000
+	defaultAuthorinoWatchedSecretLabel = "authorino.3scale.net/managed-by"
+)
+
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
-)
 
-const (
-	GRPCMaxConcurrentStreams    = 10000
-	authorinoWatchedSecretLabel = "authorino.3scale.net/managed-by"
+	watchNamespace              = common.FetchEnv("WATCH_NAMESPACE", "")
+	setupFromFilesDir           = common.FetchEnv("SETUP_FROM_FILES_DIR", "")
+	authorinoWatchedSecretLabel = common.FetchEnv("AUTHORINO_SECRET_LABEL_KEY", defaultAuthorinoWatchedSecretLabel)
+	extAuthGRPCPort             = common.FetchEnv("EXT_AUTH_GRPC_PORT", "50051")
+	oidcHTTPPort                = common.FetchEnv("OIDC_HTTP_PORT", "8003")
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(configv1beta1.AddToScheme(scheme))
+	if setupFromFilesDir == "" {
+		utilruntime.Must(configv1beta1.AddToScheme(scheme))
+	}
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -69,40 +77,67 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	managerOptions := ctrl.Options{
 		Scheme:             scheme,
 		MetricsBindAddress: metricsAddr,
 		Port:               9443,
 		LeaderElection:     enableLeaderElection,
 		LeaderElectionID:   "cb88a58a.authorino.3scale.net",
-	})
+	}
+
+	if watchNamespace != "" {
+		managerOptions.Namespace = watchNamespace
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
+
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
+	k8sClient := mgr.GetClient()
 	cache := cache.NewCache()
 
-	// sets up the service reconciler
 	serviceReconciler := &controllers.ServiceReconciler{
-		Client: mgr.GetClient(),
-		Cache:  &cache,
-		Log:    ctrl.Log.WithName("authorino").WithName("controller").WithName("Service"),
-		Scheme: mgr.GetScheme(),
-	}
-	if err = serviceReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Service")
-		os.Exit(1)
+		Client:        k8sClient,
+		ServiceReader: k8sClient,
+		ServiceWriter: k8sClient,
+		Cache:         &cache,
+		Log:           ctrl.Log.WithName("authorino").WithName("controller").WithName("Service"),
+		Scheme:        mgr.GetScheme(),
 	}
 
-	// sets up secret reconciler
-	if err = (&controllers.SecretReconciler{
-		Client:            mgr.GetClient(),
+	secretReconciler := &controllers.SecretReconciler{
+		Client:            k8sClient,
 		Log:               ctrl.Log.WithName("authorino").WithName("controller").WithName("Secret"),
 		Scheme:            mgr.GetScheme(),
-		SecretLabel:       common.FetchEnv("AUTHORINO_SECRET_LABEL_KEY", authorinoWatchedSecretLabel),
+		SecretLabel:       authorinoWatchedSecretLabel,
 		ServiceReconciler: serviceReconciler,
-	}).SetupWithManager(mgr); err != nil {
+		ServiceReader:     k8sClient,
+	}
+
+	if setupFromFilesDir != "" {
+		serviceLoader := service.NewServiceFromFileLoader(setupFromFilesDir, watchNamespace)
+
+		serviceReconciler.ServiceReader = serviceLoader
+		serviceReconciler.ServiceWriter = serviceLoader
+		secretReconciler.ServiceReader = serviceLoader
+
+		// load services to the cache ("reconcile") from files
+		go func() {
+			if err := serviceLoader.Load(mgr, serviceReconciler); err != nil {
+				panic(err)
+			}
+		}()
+	} else {
+		if err = serviceReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Service")
+			os.Exit(1)
+		}
+	}
+
+	if err = secretReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Secret")
 		os.Exit(1)
 	}
@@ -126,19 +161,18 @@ func startExtAuthServer(serviceCache *cache.Cache) {
 
 func startExtAuthServerGRPC(serviceCache *cache.Cache) {
 	logger := ctrl.Log.WithName("authorino").WithName("auth")
-	port := common.FetchEnv("EXT_AUTH_GRPC_PORT", "50051")
 
-	if lis, err := net.Listen("tcp", ":"+port); err != nil {
+	if lis, err := net.Listen("tcp", ":"+extAuthGRPCPort); err != nil {
 		logger.Error(err, "failed to obtain port for grpc auth service")
 		os.Exit(1)
 	} else {
-		opts := []grpc.ServerOption{grpc.MaxConcurrentStreams(GRPCMaxConcurrentStreams)}
+		opts := []grpc.ServerOption{grpc.MaxConcurrentStreams(gRPCMaxConcurrentStreams)}
 		s := grpc.NewServer(opts...)
 
 		envoy_auth.RegisterAuthorizationServer(s, &service.AuthService{Cache: serviceCache})
 		healthpb.RegisterHealthServer(s, &service.HealthService{})
 
-		logger.Info("starting grpc service", "port", port)
+		logger.Info("starting grpc service", "port", extAuthGRPCPort)
 
 		go func() {
 			if err := s.Serve(lis); err != nil {
@@ -155,9 +189,8 @@ func startExtAuthServerHTTP(serviceCache *cache.Cache) {
 
 func startOIDCServer(serviceCache *cache.Cache) {
 	logger := ctrl.Log.WithName("authorino").WithName("oidc")
-	port := common.FetchEnv("OIDC_HTTP_PORT", "8003")
 
-	if lis, err := net.Listen("tcp", ":"+port); err != nil {
+	if lis, err := net.Listen("tcp", ":"+oidcHTTPPort); err != nil {
 		logger.Error(err, "failed to obtain port for http oidc service")
 		os.Exit(1)
 	} else {
@@ -165,7 +198,7 @@ func startOIDCServer(serviceCache *cache.Cache) {
 			Cache: serviceCache,
 		})
 
-		logger.Info("starting oidc service", "port", port)
+		logger.Info("starting oidc service", "port", oidcHTTPPort)
 
 		go func() {
 			if err := http.Serve(lis, nil); err != nil {

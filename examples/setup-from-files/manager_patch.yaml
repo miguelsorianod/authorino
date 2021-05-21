@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        volumeMounts:
+        - mountPath: /configs
+          name: configs
+      volumes:
+        - name: configs
+          configMap:
+            name: api-protections
+            items:
+              - key: talker-api-protection.json
+                path: talker-api-protection.json
